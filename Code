@@ -6,7 +6,7 @@ import asyncio
 
 # ---------------- CONFIG ----------------
 import os
-TOKEN = os.environ['TOKEN']
+TOKEN = os.environ['TOKEN2']
 
 
 GUILD_IDS = [
@@ -246,3 +246,4 @@ async def on_ready():
 
 # ---------------- RUN BOT ----------------
 bot.run(TOKEN)
+
