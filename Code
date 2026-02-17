@@ -1,0 +1,248 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import sqlite3
+import asyncio
+
+# ---------------- CONFIG ----------------
+import os
+TOKEN = os.environ['TOKEN']
+
+
+GUILD_IDS = [
+    1446536382515515465,  # Test server
+    1471699656487469200,  # League server
+]
+
+STAFF_LOG_CHANNEL_ID = 1473352166025466096  # Staff log channel
+STAFF_ROLE_NAME = "Admin bot role access"
+MAX_VALUE = 100_000_000_000  # 100 billion
+COOLDOWN = 30  # seconds
+
+# ---------------- BOT SETUP ----------------
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ---------------- DATABASE ----------------
+conn = sqlite3.connect("values.db")
+cur = conn.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS players (
+    name TEXT PRIMARY KEY,
+    team TEXT,
+    total_value INTEGER
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS user_values (
+    user_id INTEGER,
+    player_name TEXT,
+    amount INTEGER
+)
+""")
+conn.commit()
+
+# ---------------- HELPERS ----------------
+def is_staff(member: discord.Member):
+    return any(role.name == STAFF_ROLE_NAME for role in member.roles)
+
+def get_or_create_player(name):
+    cur.execute("SELECT total_value FROM players WHERE name = ?", (name,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            "INSERT INTO players VALUES (?, ?, ?)",
+            (name, "Unassigned", 0)
+        )
+        conn.commit()
+        return 0
+    return row[0]
+
+# ---------------- AUTOCOMPLETE ----------------
+async def player_autocomplete(interaction: discord.Interaction, current: str):
+    cur.execute("SELECT name FROM players WHERE name LIKE ? LIMIT 25", (f"%{current}%",))
+    rows = cur.fetchall()
+    return [app_commands.Choice(name=row[0], value=row[0]) for row in rows]
+
+async def team_autocomplete(interaction: discord.Interaction, current: str):
+    cur.execute("SELECT DISTINCT team FROM players WHERE team LIKE ? LIMIT 25", (f"%{current}%",))
+    rows = cur.fetchall()
+    choices = [app_commands.Choice(name=row[0], value=row[0]) for row in rows if row[0] != "Unassigned"]
+    if "Unassigned".lower().startswith(current.lower()):
+        choices.append(app_commands.Choice(name="Unassigned", value="Unassigned"))
+    return choices[:25]
+
+# ---------------- COG ----------------
+class Valuation(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    # ---------------- /value ----------------
+    @app_commands.command(name="value", description="Add value to a player")
+    @app_commands.checks.cooldown(1, COOLDOWN)
+    @app_commands.autocomplete(player=player_autocomplete)
+    @app_commands.describe(player="Select a player")
+    async def value(self, interaction: discord.Interaction, player: str, amount: int):
+        if amount <= 0:
+            await interaction.response.send_message("Value must be positive.", ephemeral=True)
+            return
+
+        if amount > MAX_VALUE:
+            await interaction.response.send_message(
+                f"That value is too ridiculous 💀 (Max: {MAX_VALUE:,})", ephemeral=True
+            )
+            return
+
+        current = get_or_create_player(player)
+        new_total = current + amount
+
+        cur.execute(
+            "UPDATE players SET total_value = ? WHERE name = ?",
+            (new_total, player)
+        )
+        cur.execute(
+            "INSERT INTO user_values VALUES (?, ?, ?)",
+            (interaction.user.id, player, amount)
+        )
+        conn.commit()
+
+        await interaction.response.send_message(
+            f"Added **¥{amount:,}** to **{player}**\nNew total: **¥{new_total:,}**"
+        )
+
+        log_channel = self.bot.get_channel(STAFF_LOG_CHANNEL_ID)
+        if log_channel:
+            embed = discord.Embed(title="📊 New Valuation", color=discord.Color.red())
+            embed.add_field(name="User", value=interaction.user.mention, inline=False)
+            embed.add_field(name="Player", value=player, inline=True)
+            embed.add_field(name="Amount", value=f"¥{amount:,}", inline=True)
+            embed.add_field(name="New Total", value=f"¥{new_total:,}", inline=False)
+            await log_channel.send(embed=embed)
+
+    @value.error
+    async def value_error(self, interaction: discord.Interaction, error):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await interaction.response.send_message(
+                f"Cooldown ⏳ Try again in **{error.retry_after:.1f}s**",
+                ephemeral=True
+            )
+
+    # ---------------- /my_values ----------------
+    @app_commands.command(name="my_values", description="View your valuations")
+    async def my_values(self, interaction: discord.Interaction):
+        cur.execute(
+            "SELECT player_name, amount FROM user_values WHERE user_id = ?",
+            (interaction.user.id,)
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            await interaction.response.send_message("You haven't valued anyone yet.", ephemeral=True)
+            return
+
+        msg = "\n".join(f"**{p}** – ¥{a:,}" for p, a in rows)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    # ---------------- /leaderboard_players ----------------
+    @app_commands.command(name="leaderboard_players", description="Player leaderboard (embed)")
+    async def leaderboard_players(self, interaction: discord.Interaction):
+        cur.execute(
+            "SELECT name, total_value, team FROM players ORDER BY total_value DESC LIMIT 10"
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            await interaction.response.send_message("No players yet.")
+            return
+
+        embed = discord.Embed(title="🥇 Top 10 Players", color=discord.Color.blue())
+        for i, (name, value, team) in enumerate(rows, start=1):
+            embed.add_field(name=f"{i}. {name} ({team})", value=f"¥{value:,}", inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+    # ---------------- /leaderboard_teams ----------------
+    @app_commands.command(name="leaderboard_teams", description="Team leaderboard (embed)")
+    async def leaderboard_teams(self, interaction: discord.Interaction):
+        cur.execute("""
+            SELECT team, SUM(total_value) 
+            FROM players 
+            GROUP BY team 
+            ORDER BY SUM(total_value) DESC
+        """)
+        rows = cur.fetchall()
+
+        if not rows:
+            await interaction.response.send_message("No teams yet.")
+            return
+
+        embed = discord.Embed(title="🏆 Team Leaderboard", color=discord.Color.green())
+        for i, (team, total) in enumerate(rows, start=1):
+            embed.add_field(name=f"{i}. {team}", value=f"¥{total:,}", inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+    # ---------------- /assign_team ----------------
+    @app_commands.command(name="assign_team", description="Assign a player to a team (Staff only)")
+    @app_commands.autocomplete(player=player_autocomplete, team=team_autocomplete)
+    @app_commands.describe(player="Select a player", team="Select a team")
+    async def assign_team(self, interaction: discord.Interaction, player: str, team: str):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return
+
+        get_or_create_player(player)
+        cur.execute("UPDATE players SET team = ? WHERE name = ?", (team, player))
+        conn.commit()
+        await interaction.response.send_message(f"✅ **{player}** has been assigned to **{team}**")
+
+    # ---------------- /override ----------------
+    @app_commands.command(name="override", description="Override a player's value")
+    async def override(self, interaction: discord.Interaction, player: str, value: int):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return
+
+        get_or_create_player(player)
+        cur.execute("UPDATE players SET total_value = ? WHERE name = ?", (value, player))
+        conn.commit()
+        await interaction.response.send_message(f"**{player}** overridden to **¥{value:,}**")
+
+    # ---------------- /resetleaderboard ----------------
+    @app_commands.command(name="resetleaderboard", description="Reset all values")
+    async def resetleaderboard(self, interaction: discord.Interaction):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return
+
+        cur.execute("DELETE FROM players")
+        cur.execute("DELETE FROM user_values")
+        conn.commit()
+        await interaction.response.send_message("All values reset.")
+
+# ---------------- LOAD COG ----------------
+async def setup():
+    await bot.add_cog(Valuation(bot))
+
+asyncio.run(setup())
+
+# ---------------- GUILD SYNC ----------------
+@bot.event
+async def on_ready():
+    for guild_id in GUILD_IDS:
+        try:
+            guild = discord.Object(id=guild_id)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+            print(f"✅ Synced commands to guild {guild_id}")
+        except discord.Forbidden:
+            print(f"❌ Missing access to guild {guild_id}")
+    print(f"🤖 Logged in as {bot.user}")
+    print("Guilds bot is in:")
+    for g in bot.guilds:
+        print(g.id, g.name)
+
+# ---------------- RUN BOT ----------------
+bot.run(TOKEN)
